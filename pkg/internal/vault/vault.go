@@ -27,7 +27,7 @@ import (
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
-	"github.com/hashicorp/vault/helper/certutil"
+	"github.com/hashicorp/vault/sdk/helper/certutil"
 	corelisters "k8s.io/client-go/listers/core/v1"
 
 	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha2"
@@ -90,7 +90,7 @@ func New(namespace string, secretsLister corelisters.SecretLister,
 func (v *Vault) Sign(csrPEM []byte, duration time.Duration) (cert []byte, ca []byte, err error) {
 	csr, err := pki.DecodeX509CertificateRequestBytes(csrPEM)
 	if err != nil {
-		return nil, nil, fmt.Errorf("faild to decode CSR for signing: %s", err)
+		return nil, nil, fmt.Errorf("failed to decode CSR for signing: %s", err)
 	}
 
 	parameters := map[string]string{

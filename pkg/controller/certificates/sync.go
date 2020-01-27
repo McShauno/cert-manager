@@ -62,9 +62,12 @@ func (c *certificateRequestManager) ProcessItem(ctx context.Context, key string)
 	}
 
 	log = logf.WithResource(log, crt)
-
 	ctx = logf.NewContext(ctx, log)
 	updatedCert := crt.DeepCopy()
+
+	defer metrics.Default.UpdateCertificateExpiry(updatedCert, c.secretLister)
+	defer metrics.Default.UpdateCertificateStatus(updatedCert)
+
 	err = c.processCertificate(ctx, updatedCert)
 	log.V(logf.DebugLevel).Info("check if certificate status update is required")
 	updateStatusErr := c.updateCertificateStatus(ctx, crt, updatedCert)
@@ -132,6 +135,10 @@ func (c *certificateRequestManager) updateCertificateStatus(ctx context.Context,
 		ready = cmmeta.ConditionTrue
 		reason = "Ready"
 		message = "Certificate is up to date and has not expired"
+	case apiutil.CertificateRequestHasInvalidRequest(req):
+		reason = "InvalidRequest"
+		message = fmt.Sprintf("The certificate request could not be completed due to invalid request options: %s",
+			apiutil.CertificateRequestInvalidRequestMessage(req))
 	case req != nil:
 		reason = "InProgress"
 		message = fmt.Sprintf("Waiting for CertificateRequest %q to complete", req.Name)
@@ -167,7 +174,7 @@ func (c *certificateRequestManager) updateCertificateStatus(ctx context.Context,
 	}
 	apiutil.SetCertificateCondition(crt, cmapi.CertificateConditionReady, ready, reason, message)
 
-	_, err = updateCertificateStatus(ctx, metrics.Default, c.cmClient, old, crt)
+	_, err = updateCertificateStatus(ctx, c.cmClient, old, crt)
 	if err != nil {
 		return err
 	}
@@ -333,15 +340,14 @@ func (c *certificateRequestManager) processCertificate(ctx context.Context, crt 
 			log.Info("no existing certificate data found in secret, issuing temporary certificate")
 			return c.issueTemporaryCertificate(ctx, existingSecret, crt, existingKey)
 		}
-		// We don't issue a temporary certificate if the existing stored
-		// certificate already 'matches', even if it isn't a temporary certificate.
-		matches, _ := certificateMatchesSpec(crt, privateKey, existingX509Cert, existingSecret)
-		if !matches {
-			log.Info("existing certificate fields do not match certificate spec, issuing temporary certificate")
+
+		matches, err := pki.PublicKeyMatchesCertificate(privateKey.Public(), existingX509Cert)
+		if err != nil || !matches {
+			log.Info("private key for certificate does not match, issuing temporary certificate")
 			return c.issueTemporaryCertificate(ctx, existingSecret, crt, existingKey)
 		}
 
-		log.Info("not issuing temporary certificate as existing certificate matches requirements")
+		log.Info("not issuing temporary certificate as existing certificate is sufficient")
 
 		// Ensure the secret metadata is up to date
 		updated, err := c.ensureSecretMetadataUpToDate(ctx, existingSecret, crt)
@@ -378,7 +384,10 @@ func (c *certificateRequestManager) processCertificate(ctx context.Context, crt 
 	// Validate the CertificateRequest's CSR is valid
 	log.Info("validating existing CSR data")
 	x509CSR, err := pki.DecodeX509CertificateRequestBytes(existingReq.Spec.CSRPEM)
-	// TODO: handle InvalidData
+	if errors.IsInvalidData(err) {
+		log.Info("failed to decode existing CSR on CertificateRequest, deleting resource...")
+		return c.cmClient.CertmanagerV1alpha2().CertificateRequests(existingReq.Namespace).Delete(existingReq.Name, nil)
+	}
 	if err != nil {
 		return err
 	}
@@ -405,13 +414,25 @@ func (c *certificateRequestManager) processCertificate(ctx context.Context, crt 
 	}
 
 	reason := apiutil.CertificateRequestReadyReason(existingReq)
+
+	// If the CertificateRequest condition is present and has the status of
+	// "True" then do not attempt to retry the CertificateRequest. Else we can
+	// retry.
+	if apiutil.CertificateRequestHasInvalidRequest(existingReq) {
+		log.Info("CertificateRequest is in an InvalidRequest state and will no longer be processed", "state", reason)
+
+		c.recorder.Eventf(crt, corev1.EventTypeWarning, "CertificateRequestInvalidRequest", "The failed CertificateRequest %q is an invalid request and will no longer be processed", existingReq.Name)
+		return nil
+	}
+
 	// Determine the status reason of the CertificateRequest and process accordingly
 	switch reason {
-	// If the CertificateRequest exists but has failed then we check the failure
-	// time. If the failure time doesn't exist or is over an hour in the past
-	// then delete the request so it can be re-created on the next sync. If the
-	// failure time is less than an hour in the past then schedule this owning
-	// Certificate for a re-sync in an hour.
+
+	// If the CertificateRequest exists but has failed then we check the if the
+	// failure time doesn't exist or is over an hour in the past then delete the
+	// request so it can be re-created on the next sync. If the failure time is
+	// less than an hour in the past then schedule this owning Certificate for a
+	// re-sync in an hour.
 	case cmapi.CertificateRequestReasonFailed:
 		if existingReq.Status.FailureTime == nil || c.clock.Since(existingReq.Status.FailureTime.Time) > time.Hour {
 			log.Info("deleting failed certificate request")
@@ -446,6 +467,16 @@ func (c *certificateRequestManager) processCertificate(ctx context.Context, crt 
 		x509Cert, err := pki.DecodeX509CertificateBytes(existingReq.Status.Certificate)
 		if err != nil {
 			return err
+		}
+
+		log.Info("checking stored private key is valid for stored x509 certificate on CertificateRequest")
+		publicKeyMatches, err := pki.PublicKeyMatchesCertificate(privateKey.Public(), x509Cert)
+		if err != nil {
+			return err
+		}
+		if !publicKeyMatches {
+			log.Info("private key stored in Secret does not match public key of issued certificate, deleting the old CertificateRequest resource")
+			return c.cmClient.CertmanagerV1alpha2().CertificateRequests(existingReq.Namespace).Delete(existingReq.Name, nil)
 		}
 
 		// Check if the Certificate requires renewal according to the renewBefore
@@ -487,6 +518,7 @@ func (c *certificateRequestManager) processCertificate(ctx context.Context, crt 
 // Otherwise, the existing resource will be updated.
 // The first return argument will be true if the resource was updated/created
 // without error.
+// updateSecretData will also update deprecated annotations if they exist.
 func (c *certificateRequestManager) updateSecretData(ctx context.Context, crt *cmapi.Certificate, existingSecret *corev1.Secret, data secretData) (bool, error) {
 	s := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -775,6 +807,7 @@ type secretData struct {
 // setSecretValues will NOT actually update the resource in the apiserver.
 // If updating an existing Secret resource returned by an api client 'lister',
 // make sure to DeepCopy the object first to avoid modifying data in-cache.
+// It will also update depreciated issuer name and kind annotations if they exist.
 func setSecretValues(ctx context.Context, crt *cmapi.Certificate, s *corev1.Secret, data secretData) error {
 	// initialize the `Data` field if it is nil
 	if s.Data == nil {
@@ -792,6 +825,15 @@ func setSecretValues(ctx context.Context, crt *cmapi.Certificate, s *corev1.Secr
 	s.Annotations[cmapi.CertificateNameKey] = crt.Name
 	s.Annotations[cmapi.IssuerNameAnnotationKey] = crt.Spec.IssuerRef.Name
 	s.Annotations[cmapi.IssuerKindAnnotationKey] = apiutil.IssuerKind(crt.Spec.IssuerRef)
+
+	// If deprecated annotations exist with any value, then they too shall be
+	// updated
+	if _, ok := s.Annotations[cmapi.DeprecatedIssuerNameAnnotationKey]; ok {
+		s.Annotations[cmapi.DeprecatedIssuerNameAnnotationKey] = crt.Spec.IssuerRef.Name
+	}
+	if _, ok := s.Annotations[cmapi.DeprecatedIssuerKindAnnotationKey]; ok {
+		s.Annotations[cmapi.DeprecatedIssuerKindAnnotationKey] = apiutil.IssuerKind(crt.Spec.IssuerRef)
+	}
 
 	// if the certificate data is empty, clear the subject related annotations
 	if len(data.cert) == 0 {

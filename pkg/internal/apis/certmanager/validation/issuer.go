@@ -25,27 +25,27 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	cmacme "github.com/jetstack/cert-manager/pkg/apis/acme/v1alpha2"
-	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha2"
-	cmmeta "github.com/jetstack/cert-manager/pkg/apis/meta/v1"
+	cmacme "github.com/jetstack/cert-manager/pkg/internal/apis/acme"
+	"github.com/jetstack/cert-manager/pkg/internal/apis/certmanager"
 	"github.com/jetstack/cert-manager/pkg/internal/apis/certmanager/validation/util"
+	cmmeta "github.com/jetstack/cert-manager/pkg/internal/apis/meta"
 )
 
 // Validation functions for cert-manager v1alpha2 Issuer types
 
 func ValidateIssuer(obj runtime.Object) field.ErrorList {
-	iss := obj.(*v1alpha2.Issuer)
+	iss := obj.(*certmanager.Issuer)
 	allErrs := ValidateIssuerSpec(&iss.Spec, field.NewPath("spec"))
 	return allErrs
 }
 
-func ValidateIssuerSpec(iss *v1alpha2.IssuerSpec, fldPath *field.Path) field.ErrorList {
+func ValidateIssuerSpec(iss *certmanager.IssuerSpec, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 	el = ValidateIssuerConfig(&iss.IssuerConfig, fldPath)
 	return el
 }
 
-func ValidateIssuerConfig(iss *v1alpha2.IssuerConfig, fldPath *field.Path) field.ErrorList {
+func ValidateIssuerConfig(iss *certmanager.IssuerConfig, fldPath *field.Path) field.ErrorList {
 	numConfigs := 0
 	el := field.ErrorList{}
 	if iss.ACME != nil {
@@ -103,6 +103,20 @@ func ValidateACMEIssuerConfig(iss *cmacme.ACMEIssuer, fldPath *field.Path) field
 	if len(iss.Server) == 0 {
 		el = append(el, field.Required(fldPath.Child("server"), "acme server URL is a required field"))
 	}
+
+	if eab := iss.ExternalAccountBinding; eab != nil {
+		eabFldPath := fldPath.Child("externalAccountBinding")
+		if len(eab.KeyID) == 0 {
+			el = append(el, field.Required(eabFldPath.Child("keyID"), "the keyID field is required when using externalAccountBinding"))
+		}
+
+		el = append(el, ValidateSecretKeySelector(&eab.Key, eabFldPath.Child("keySecretRef"))...)
+
+		if len(eab.KeyAlgorithm) == 0 {
+			el = append(el, field.Required(eabFldPath.Child("keyAlgorithm"), "the keyAlgorithm field is required when using externalAccountBinding"))
+		}
+	}
+
 	for i, sol := range iss.Solvers {
 		el = append(el, ValidateACMEIssuerChallengeSolverConfig(&sol, fldPath.Child("solvers").Index(i))...)
 	}
@@ -163,7 +177,7 @@ func ValidateACMEIssuerChallengeSolverHTTP01IngressConfig(ingress *cmacme.ACMECh
 	return el
 }
 
-func ValidateCAIssuerConfig(iss *v1alpha2.CAIssuer, fldPath *field.Path) field.ErrorList {
+func ValidateCAIssuerConfig(iss *certmanager.CAIssuer, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 	if len(iss.SecretName) == 0 {
 		el = append(el, field.Required(fldPath.Child("secretName"), ""))
@@ -171,11 +185,11 @@ func ValidateCAIssuerConfig(iss *v1alpha2.CAIssuer, fldPath *field.Path) field.E
 	return el
 }
 
-func ValidateSelfSignedIssuerConfig(iss *v1alpha2.SelfSignedIssuer, fldPath *field.Path) field.ErrorList {
+func ValidateSelfSignedIssuerConfig(iss *certmanager.SelfSignedIssuer, fldPath *field.Path) field.ErrorList {
 	return nil
 }
 
-func ValidateVaultIssuerConfig(iss *v1alpha2.VaultIssuer, fldPath *field.Path) field.ErrorList {
+func ValidateVaultIssuerConfig(iss *certmanager.VaultIssuer, fldPath *field.Path) field.ErrorList {
 	el := field.ErrorList{}
 	if len(iss.Server) == 0 {
 		el = append(el, field.Required(fldPath.Child("server"), ""))
@@ -198,7 +212,7 @@ func ValidateVaultIssuerConfig(iss *v1alpha2.VaultIssuer, fldPath *field.Path) f
 	// TODO: add validation for Vault authentication types
 }
 
-func ValidateVenafiIssuerConfig(iss *v1alpha2.VenafiIssuer, fldPath *field.Path) field.ErrorList {
+func ValidateVenafiIssuerConfig(iss *certmanager.VenafiIssuer, fldPath *field.Path) field.ErrorList {
 	//TODO: make extended validation fro fake\tpp\cloud modes
 	return nil
 }
@@ -280,7 +294,18 @@ func ValidateACMEChallengeSolverDNS01(p *cmacme.ACMEChallengeSolverDNS01, fldPat
 			el = append(el, field.Forbidden(fldPath.Child("cloudflare"), "may not specify more than one provider type"))
 		} else {
 			numProviders++
-			el = append(el, ValidateSecretKeySelector(&p.Cloudflare.APIKey, fldPath.Child("cloudflare", "apiKeySecretRef"))...)
+			if p.Cloudflare.APIKey != nil {
+				el = append(el, ValidateSecretKeySelector(p.Cloudflare.APIKey, fldPath.Child("cloudflare", "apiKeySecretRef"))...)
+			}
+			if p.Cloudflare.APIToken != nil {
+				el = append(el, ValidateSecretKeySelector(p.Cloudflare.APIToken, fldPath.Child("cloudflare", "apiTokenSecretRef"))...)
+			}
+			if p.Cloudflare.APIKey != nil && p.Cloudflare.APIToken != nil {
+				el = append(el, field.Forbidden(fldPath.Child("cloudflare"), "apiKeySecretRef and apiTokenSecretRef cannot both be specified"))
+			}
+			if p.Cloudflare.APIKey == nil && p.Cloudflare.APIToken == nil {
+				el = append(el, field.Required(fldPath.Child("cloudflare"), "apiKeySecretRef or apiTokenSecretRef is required"))
+			}
 			if len(p.Cloudflare.Email) == 0 {
 				el = append(el, field.Required(fldPath.Child("cloudflare", "email"), ""))
 			}

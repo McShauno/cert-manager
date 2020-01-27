@@ -38,7 +38,6 @@ import (
 	cmlisters "github.com/jetstack/cert-manager/pkg/client/listers/certmanager/v1alpha2"
 	controllerpkg "github.com/jetstack/cert-manager/pkg/controller"
 	logf "github.com/jetstack/cert-manager/pkg/logs"
-	"github.com/jetstack/cert-manager/pkg/metrics"
 	"github.com/jetstack/cert-manager/pkg/util"
 	"github.com/jetstack/cert-manager/pkg/util/errors"
 	"github.com/jetstack/cert-manager/pkg/util/kube"
@@ -121,14 +120,30 @@ func certificateMatchesSpec(crt *v1alpha2.Certificate, key crypto.Signer, cert *
 		secret.Annotations = make(map[string]string)
 	}
 
-	// validate that the issuer is correct
-	if crt.Spec.IssuerRef.Name != secret.Annotations[v1alpha2.IssuerNameAnnotationKey] {
-		errs = append(errs, fmt.Sprintf("Issuer of the certificate is not up to date: %q", secret.Annotations[v1alpha2.IssuerNameAnnotationKey]))
+	// Validate that the issuer name and kind is correct
+	// If the new annotation exists and doesn't match then error
+	// If the new annotation doesn't exist and the old annotation doesn't match then error
+
+	annotationError := func(k, v string) {
+		errs = append(errs, fmt.Sprintf("Issuer %q of the certificate is not up to date: %q", k, v))
 	}
 
-	// validate that the issuer kind is correct
-	if apiutil.IssuerKind(crt.Spec.IssuerRef) != secret.Annotations[v1alpha2.IssuerKindAnnotationKey] {
-		errs = append(errs, fmt.Sprintf("Issuer kind of the certificate is not up to date: %q", secret.Annotations[v1alpha2.IssuerKindAnnotationKey]))
+	name, ok := secret.Annotations[v1alpha2.IssuerNameAnnotationKey]
+	if !ok {
+		if secret.Annotations[v1alpha2.DeprecatedIssuerNameAnnotationKey] != crt.Spec.IssuerRef.Name {
+			annotationError(v1alpha2.DeprecatedIssuerNameAnnotationKey, secret.Annotations[v1alpha2.DeprecatedIssuerNameAnnotationKey])
+		}
+	} else if name != crt.Spec.IssuerRef.Name {
+		annotationError(v1alpha2.IssuerNameAnnotationKey, secret.Annotations[v1alpha2.IssuerNameAnnotationKey])
+	}
+
+	kind, ok := secret.Annotations[v1alpha2.IssuerKindAnnotationKey]
+	if !ok {
+		if secret.Annotations[v1alpha2.DeprecatedIssuerKindAnnotationKey] != apiutil.IssuerKind(crt.Spec.IssuerRef) {
+			annotationError(v1alpha2.DeprecatedIssuerKindAnnotationKey, secret.Annotations[v1alpha2.DeprecatedIssuerKindAnnotationKey])
+		}
+	} else if kind != apiutil.IssuerKind(crt.Spec.IssuerRef) {
+		annotationError(v1alpha2.IssuerKindAnnotationKey, secret.Annotations[v1alpha2.IssuerKindAnnotationKey])
 	}
 
 	return len(errs) == 0, errs
@@ -221,9 +236,7 @@ func generateLocallySignedTemporaryCertificate(crt *v1alpha2.Certificate, pk []b
 	return b, nil
 }
 
-func updateCertificateStatus(ctx context.Context, m *metrics.Metrics, cmClient cmclient.Interface, old, new *v1alpha2.Certificate) (*v1alpha2.Certificate, error) {
-	defer m.UpdateCertificateStatus(new)
-
+func updateCertificateStatus(ctx context.Context, cmClient cmclient.Interface, old, new *v1alpha2.Certificate) (*v1alpha2.Certificate, error) {
 	log := logf.FromContext(ctx, "updateStatus")
 	oldBytes, _ := json.Marshal(old.Status)
 	newBytes, _ := json.Marshal(new.Status)

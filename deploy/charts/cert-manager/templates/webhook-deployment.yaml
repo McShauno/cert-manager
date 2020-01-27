@@ -10,6 +10,10 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     helm.sh/chart: {{ include "webhook.chart" . }}
+  {{- if .Values.webhook.deploymentAnnotations }}
+  annotations:
+{{ toYaml .Values.webhook.deploymentAnnotations | indent 4 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.webhook.replicaCount }}
   selector:
@@ -38,6 +42,10 @@ spec:
       serviceAccountName: {{ include "webhook.fullname" . }}
       {{- if .Values.global.priorityClassName }}
       priorityClassName: {{ .Values.global.priorityClassName | quote }}
+      {{- end }}
+      {{- if .Values.webhook.securityContext}}
+      securityContext:
+{{ toYaml .Values.webhook.securityContext | indent 8 }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}

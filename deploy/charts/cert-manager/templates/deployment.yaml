@@ -9,6 +9,10 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     helm.sh/chart: {{ template "cert-manager.chart" . }}
+  {{- if .Values.deploymentAnnotations }}
+  annotations:
+{{ toYaml .Values.deploymentAnnotations | indent 4 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -32,11 +36,14 @@ spec:
 {{- if .Values.podLabels }}
 {{ toYaml .Values.podLabels | indent 8 }}
 {{- end }}
-      annotations:
       {{- if .Values.podAnnotations }}
+      annotations:
 {{ toYaml .Values.podAnnotations | indent 8 }}
       {{- end }}
       {{- if and .Values.prometheus.enabled (not .Values.prometheus.servicemonitor.enabled) }}
+      {{- if not .Values.podAnnotations }}
+      annotations:
+      {{- end }}
         prometheus.io/path: "/metrics"
         prometheus.io/scrape: 'true'
         prometheus.io/port: '9402'
@@ -46,10 +53,22 @@ spec:
       {{- if .Values.global.priorityClassName }}
       priorityClassName: {{ .Values.global.priorityClassName | quote }}
       {{- end }}
-      {{- if .Values.securityContext.enabled }}
+      {{- $enabledDefined := gt (len (keys (pick .Values.securityContext "enabled"))) 0 }}
+      {{- $legacyEnabledExplicitlydOff := and $enabledDefined (not .Values.securityContext.enabled) }}
+      {{- if and .Values.securityContext (not $legacyEnabledExplicitlydOff) }}
       securityContext:
-        fsGroup: {{ .Values.securityContext.fsGroup }}
-        runAsUser: {{ .Values.securityContext.runAsUser }}
+        {{- if .Values.securityContext.enabled -}}
+        {{/* support legacy securityContext.enabled and its two parameters */}}
+        fsGroup: {{ default 1001 .Values.securityContext.fsGroup }}
+        runAsUser: {{ default 1001 .Values.securityContext.runAsUser }}
+        {{- else -}}
+        {{/* this is the way forward: support an arbitrary yaml block */}}
+{{ toYaml .Values.securityContext | indent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.volumes }}
+      volumes:
+{{ toYaml .Values.volumes | indent 8 }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
@@ -85,6 +104,11 @@ spec:
           - --webhook-dns-names={{ include "webhook.fullname" . }},{{ include "webhook.fullname" . }}.{{ .Release.Namespace }},{{ include "webhook.fullname" . }}.{{ .Release.Namespace }}.svc
           ports:
           - containerPort: 9402
+            protocol: TCP
+          {{- if .Values.volumeMounts }}
+          volumeMounts:
+{{ toYaml .Values.volumeMounts | indent 12 }}
+          {{- end }}
           env:
           - name: POD_NAMESPACE
             valueFrom:
